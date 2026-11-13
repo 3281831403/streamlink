@@ -9,6 +9,7 @@ from streamlink.stream.hls.segment import (
     ByteRange,
     DateRange,
     ExtInf,
+    HLSInitSegment,
     HLSPlaylist,
     HLSSegment,
     IFrameStreamInfo,

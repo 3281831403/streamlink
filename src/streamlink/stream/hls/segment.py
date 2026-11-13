@@ -285,3 +285,32 @@ class HLSSegment(Segment):
 
     def iter_content(self, response: Response, chunk_size: int) -> Iterator[bytes]:
         yield from response.iter_content(chunk_size)
+
+
+@dataclass(kw_only=True)
+class HLSInitSegment(Segment):
+    """
+    An independent initialization section segment (``EXT-X-MAP``),
+    which is processed separately from regular media segments.
+    """
+
+    map: Map
+
+    def __post_init__(self) -> None:
+        self.init = True
+        self.uri = self.map.uri
+
+    @property
+    def byterange(self) -> ByteRange | None:
+        return self.map.byterange
+
+    @property
+    def key(self) -> Key | None:
+        return self.map.key
+
+    # noinspection PyMethodMayBeStatic
+    def get_content(self, response: Response) -> bytes:
+        return response.content
+
+    def iter_content(self, response: Response, chunk_size: int) -> Iterator[bytes]:
+        yield from response.iter_content(chunk_size)

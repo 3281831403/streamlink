@@ -374,6 +374,84 @@ class TestHLSStream(TestMixinStreamHLS, unittest.TestCase):
         assert self.called(map1, once=True), "Downloads first map only once"
         assert self.called(map2, once=True), "Downloads second map only once"
 
+    def test_map_retry(self):
+        # the init segment must be retried independently after all per-request retries were exhausted,
+        # instead of being dropped permanently while the following media segments keep getting written
+        map1 = TagMap(1, self.id())
+        self.mock(
+            "GET",
+            self.url(map1),
+            [
+                {"status_code": 500},
+                {"status_code": 500},
+                {"content": map1.content},
+            ],
+        )
+
+        segments = self.subject(
+            [
+                Playlist(0, [map1, Segment(0), Segment(1)], end=True),
+            ],
+            # don't retry within a single map fetch attempt, so the writer's own retry logic gets exercised
+            options={"stream-segment-attempts": 1},
+        )
+
+        data = self.await_read(read_all=True, timeout=None)
+        assert data == self.content([map1, segments[0], segments[1]]), "Writes the map after retrying it, before its segments"
+        assert self.get_mock(map1).call_count == 3, "Retries fetching the map until it succeeds"
+        assert self.called(segments[0]), "Still downloads the first dependent media segment"
+        assert self.called(segments[1]), "Still downloads the second dependent media segment"
+        map_url = self.url(map1)
+        map_error_msg = (
+            f"Failed to fetch map for segment 0: Unable to open URL: {map_url} "
+            + f"(500 Server Error: None for url: {map_url})"
+        )
+        assert [(record.name, record.levelname, record.getMessage()) for record in self.caplog.records] == [
+            ("streamlink.stream.hls", "error", map_error_msg),
+        ], "Logs the failed map fetch attempt while keeping the init segment queued for independent retries"
+
+    def test_map_not_affected_by_segment_filtering(self):
+        # filtering out the media segment which carries a new EXT-X-MAP must not cause the init data to be dropped
+        map1 = TagMap(1, self.id())
+        map2 = TagMap(2, self.id())
+        self.mock("GET", self.url(map1), content=map1.content)
+        self.mock("GET", self.url(map2), content=map2.content)
+
+        segments = self.subject(
+            [
+                Playlist(0, [map1, Segment(0), map2, Segment(1), Segment(2)], end=True),
+            ],
+            options={"hls-segment-ignore-names": ["segment1"]},
+        )
+
+        data = self.await_read(read_all=True, timeout=None)
+        assert data == map1.content + segments[0].content + map2.content + segments[2].content, (
+            "Writes the map even though its dependent media segment gets filtered out"
+        )
+        assert self.called(map1, once=True), "Downloads the first map"
+        assert self.called(map2, once=True), "Downloads the new map regardless of the filtered media segment"
+        assert self.called(segments[1]), "Still downloads the filtered media segment, but discards its data"
+        assert segments[1].content not in data, "Discards the filtered media segment's data"
+
+    def test_map_byterange_identity(self):
+        # the same map URI with a changing BYTERANGE must be treated as different init data:
+        # both ranges get requested and the correct bytes are written, instead of reusing stale init data
+        map1 = TagMap(1, self.id(), {"BYTERANGE": '"3@0"'})
+        map2 = TagMap(1, self.id(), {"BYTERANGE": '"5@10"'})
+        self.mock("GET", self.url(map1), content=map1.content)
+
+        segments = self.subject([
+            Playlist(0, [map1, Segment(0), map2, Segment(1)], end=True),
+        ])
+
+        data = self.await_read(read_all=True, timeout=None)
+        assert data == self.content([map1, segments[0], map2, segments[1]]), (
+            "Writes both init sections, identified by URI and BYTERANGE"
+        )
+        assert self.get_mock(map1).call_count == 2, "Fetches the same map URI twice due to the different BYTERANGE"
+        requests = [req._request for req in self.get_mock(map1).request_history]
+        assert [req.headers["Range"] for req in requests] == ["bytes=0-2", "bytes=10-14"]
+
 
 # TODO: finally rewrite the segmented/HLS test setup using pytest and replace redundant setups with parametrization
 @patch("streamlink.stream.hls.hls.HLSStreamWorker.wait", Mock(return_value=True))

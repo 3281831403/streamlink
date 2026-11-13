@@ -3,10 +3,11 @@ from __future__ import annotations
 import re
 import struct
 import warnings
+from concurrent.futures import Future
 from dataclasses import dataclass
 from datetime import timedelta
 from struct import unpack
-from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypeVar
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypeAlias, TypeVar, cast
 from urllib.parse import urlparse
 
 from requests import Response
@@ -22,7 +23,7 @@ from streamlink.logger import getLogger
 from streamlink.stream.ffmpegmux import FFMPEGMuxer, MuxedStream
 from streamlink.stream.filtered import FilteredStream
 from streamlink.stream.hls.m3u8 import M3U8Parser, parse_m3u8
-from streamlink.stream.hls.segment import HLSSegment
+from streamlink.stream.hls.segment import HLSInitSegment, HLSSegment
 from streamlink.stream.http import HTTPStream
 from streamlink.stream.segmented import SegmentedStreamReader, SegmentedStreamWorker, SegmentedStreamWriter
 from streamlink.utils.cache import LRUCache
@@ -37,7 +38,6 @@ from streamlink.utils.times import now
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping
-    from concurrent.futures import Future
     from datetime import datetime
 
     from typing_extensions import Self
@@ -49,6 +49,18 @@ if TYPE_CHECKING:
 
 
 log = getLogger(".".join(__name__.split(".")[:-1]))
+
+
+# Sentinels for failed init-segment (EXT-X-MAP) fetch attempts.
+# Unlike regular media segments, a failed init fetch must not be dropped: the queued init segment is still
+# passed to write(), where write_init() retries transient failures independently until they succeed.
+# Permanent failures (e.g. missing BYTERANGE offsets) are not retryable and close the stream instead.
+INIT_FETCH_FAILED = object()
+INIT_FETCH_PERMANENT = object()
+
+# union of a regular HTTP response and the init-segment fetch-failure sentinels
+HLSWriterResult: TypeAlias = Response | object
+HLSWriterFuture: TypeAlias = "Future[HLSWriterResult]"
 
 
 @dataclass
@@ -121,7 +133,9 @@ class HLSStreamWriter(SegmentedStreamWriter[HLSSegment, Response]):
         options = self.session.options
 
         self.byterange: ByteRangeOffset = ByteRangeOffset()
-        self.map_cache: LRUCache[str, Future] = LRUCache(self.threads)
+        # the map cache is keyed by the map's URI and BYTERANGE,
+        # so that maps with the same URI but a different BYTERANGE don't get mixed up
+        self.map_cache: LRUCache[tuple[str, tuple[int, int | None] | None], HLSWriterFuture] = LRUCache(self.threads)
         self.key_data: bytes | bytearray | memoryview = b""
         self.key_uri: str | None = None
         self.key_uri_override = options.get("hls-segment-key-uri")
@@ -182,7 +196,23 @@ class HLSStreamWriter(SegmentedStreamWriter[HLSSegment, Response]):
 
         return AES.new(self.key_data, AES.MODE_CBC, iv)
 
-    def create_request_params(self, num: int, segment: HLSSegment | Map, is_map: bool):
+    @staticmethod
+    def map_cache_key(segment_map: Map) -> tuple[str, tuple[int, int | None] | None]:
+        byterange = segment_map.byterange
+        return segment_map.uri, None if byterange is None else (byterange.range, byterange.offset)
+
+    def create_init_segment(self, segment: HLSSegment) -> HLSInitSegment:
+        segment_map = segment.map
+        assert segment_map is not None
+
+        return HLSInitSegment(
+            num=segment.num,
+            duration=0.0,
+            uri=segment_map.uri,
+            map=segment_map,
+        )
+
+    def create_request_params(self, num: int, segment: HLSSegment | HLSInitSegment, is_map: bool):
         request_params = dict(self.reader.request_params)
         headers = request_params.pop("headers", {})
 
@@ -205,22 +235,23 @@ class HLSStreamWriter(SegmentedStreamWriter[HLSSegment, Response]):
             self.queue(None, None)
             return
 
-        # queue segment-map first
+        # queue the initialization section (EXT-X-MAP) first, as a separate and independent segment.
+        # each unique init data (identified by URI + BYTERANGE) is queued only once and stays in front
+        # of its dependent media segments. on a discontinuity, the init segment is re-queued regardless
+        # (reusing a cached response if available), so its data gets written at the new position.
+        # failed fetches are retried independently of the media segment fetch (see write_init).
         if segment.map is not None:
-            # get the cached segment-map, if available
-            future = self.map_cache.get(segment.map.uri)
-            if future and segment.discontinuity:
-                # special case: queue the cached segment map if it's set on a discontinuity segment
-                self.queue(segment, future, True)
-            elif not future:
-                # keep the segment-map in the cache, so we can check whether we've already queued it
-                future = self.executor.submit(self.fetch_map, segment)
-                self.map_cache.set(segment.map.uri, future)
-                self.queue(segment, future, True)
+            cache_key = self.map_cache_key(segment.map)
+            future = self.map_cache.get(cache_key)
+            if not future or segment.discontinuity:
+                init = self.create_init_segment(segment)
+                # reuse the cached response future on a discontinuity if available, otherwise fetch the init
+                future = future or self.executor.submit(self.fetch_init, init)
+                self.map_cache.set(cache_key, future)
+                self.queue(cast("HLSSegment", init), future)
 
         # regular segment request
-        future = self.executor.submit(self.fetch, segment)
-        self.queue(segment, future, False)
+        self.queue(segment, cast("HLSWriterFuture", self.executor.submit(self.fetch, segment)))
 
     def fetch(self, segment: HLSSegment) -> Response | None:
         try:
@@ -232,16 +263,27 @@ class HLSStreamWriter(SegmentedStreamWriter[HLSSegment, Response]):
         except StreamError as err:
             log.error(f"Failed to fetch segment {segment.num}: {err}")
 
-    def fetch_map(self, segment: HLSSegment) -> Response | None:
-        segment_map: Map = segment.map  # type: ignore[assignment, ty:invalid-assignment]  # map is not None
+    def fetch_init(self, segment: HLSInitSegment) -> Response | object:
         try:
-            return self._fetch(
-                segment_map.uri,
-                stream=False,
-                **self.create_request_params(segment.num, segment_map, True),
-            )
+            request_params = self.create_request_params(segment.num, segment, True)
+        except StreamError as err:
+            # permanent request-parameter failure (e.g. missing BYTERANGE offset): not retryable
+            log.error(f"Failed to fetch map for segment {segment.num}: {err}")
+            return INIT_FETCH_PERMANENT
+
+        try:
+            return self._fetch(segment.uri, stream=False, **request_params) or INIT_FETCH_FAILED
         except StreamError as err:
             log.error(f"Failed to fetch map for segment {segment.num}: {err}")
+            return INIT_FETCH_FAILED
+
+    def _fetch_init(self, segment: HLSInitSegment) -> Response | object:
+        # retry the init fetch on the writer thread and keep the new in-flight future in the cache,
+        # so other segments referencing the same map can wait for it instead of fetching it again
+        future = self.executor.submit(self.fetch_init, segment)
+        self.map_cache.set(self.map_cache_key(segment.map), future)
+
+        return future.result()
 
     def _fetch(self, url: str, **request_params) -> Response | None:
         if self.closed or not self.retries:  # pragma: no cover
@@ -258,13 +300,68 @@ class HLSStreamWriter(SegmentedStreamWriter[HLSSegment, Response]):
     def should_filter_segment(self, segment: HLSSegment) -> bool:
         return self.ignore_names is not None and self.ignore_names.search(segment.uri) is not None
 
-    def write(self, segment: HLSSegment, result: Response, *data):
+    def write(self, segment: HLSSegment | HLSInitSegment, result: Response | object, *data):
+        if isinstance(segment, HLSInitSegment):
+            self.write_init(segment, result)
+        elif isinstance(result, Response):
+            self.write_media(segment, result)
+
+    def write_init(self, segment: HLSInitSegment, result: Response | object):
+        # initialization sections are processed independently of regular media segments:
+        # they are not affected by segment filtering, permanent failures close the stream and
+        # transient failures are retried until they succeed, so init data is always written
+        # before the dependent segments
+        cache_key = self.map_cache_key(segment.map)
+
+        while not self.closed:
+            # a permanent failure (e.g. a missing BYTERANGE offset) was already logged in fetch_init()
+            if result is INIT_FETCH_PERMANENT:
+                self.close()
+                return
+
+            if result is INIT_FETCH_FAILED or result is None:
+                # check whether an in-flight init request for the same map has produced a usable
+                # response meanwhile; a failed cached future is evicted so it can't be reused forever
+                cached = self.map_cache.get(cache_key)
+                if cached is not None and cached.done():
+                    cached_result = cached.result()
+                    if cached_result is INIT_FETCH_PERMANENT:
+                        self.close()
+                        return
+                    if cached_result is not INIT_FETCH_FAILED:
+                        result = cached_result
+                    else:
+                        self.map_cache.cache.pop(cache_key, None)
+
+                if result is INIT_FETCH_FAILED or result is None:
+                    # fetch_init() handles permanent request-parameter failures via INIT_FETCH_PERMANENT
+                    result = self._fetch_init(segment)
+                    if result is INIT_FETCH_FAILED:
+                        continue
+
+            # result is a regular Response here
+            if not isinstance(result, Response):  # pragma: no cover
+                result = None
+                continue
+            if self._write(segment, result):
+                log.debug(f"Segment initialization {segment.num} complete")
+                # replace the in-flight future with the successful response, so a re-queued init segment
+                # referencing the same map (e.g. after a discontinuity) can reuse the downloaded data
+                success_future: Future[Response | object] = Future()
+                success_future.set_result(result)
+                self.map_cache.set(cache_key, success_future)
+                return
+
+            # the response data was consumed or is otherwise unusable: fetch it again and retry
+            result = None
+
+    def write_media(self, segment: HLSSegment, result: Response):
         if not self.should_filter_segment(segment):
             log.debug(f"Writing segment {segment.num} to output")
 
             written_once = self.reader.buffer.written_once
             try:
-                self._write(segment, result, *data)
+                self._write(segment, result)
             finally:
                 is_paused = self.reader.is_paused()
 
@@ -292,23 +389,20 @@ class HLSStreamWriter(SegmentedStreamWriter[HLSSegment, Response]):
                 log.info("Filtering out segments and pausing stream output")
                 self.reader.pause()
 
-    def _write(self, segment: HLSSegment, response: Response, is_map: bool):
-        # TODO: Rewrite HLSSegment, HLSStreamWriter and HLSStreamWorker based on independent initialization section segments,
-        #       similar to the DASH implementation
-        key = segment.map.key if is_map and segment.map else segment.key
+    def _write(self, segment: HLSSegment | HLSInitSegment, response: Response) -> bool:
+        key = segment.key
 
         if key and key.method != "NONE" and not self.passthrough_encrypted:
             success = self._write_decrypt(segment, response, key)
         else:
             success = self._write_plain(segment, response)
 
-        if success:
-            if is_map:
-                log.debug(f"Segment initialization {segment.num} complete")
-            else:
-                log.debug(f"Segment {segment.num} complete")
+        if success and not segment.init:
+            log.debug(f"Segment {segment.num} complete")
 
-    def _write_decrypt(self, segment: HLSSegment, response: Response, key: Key) -> bool:
+        return success
+
+    def _write_decrypt(self, segment: HLSSegment | HLSInitSegment, response: Response, key: Key) -> bool:
         try:
             decryptor = self.create_decryptor(key, segment.num)
         except (StreamError, ValueError) as err:
@@ -336,7 +430,7 @@ class HLSStreamWriter(SegmentedStreamWriter[HLSSegment, Response]):
 
         return True
 
-    def _write_plain(self, segment: HLSSegment, response: Response) -> bool:
+    def _write_plain(self, segment: HLSSegment | HLSInitSegment, response: Response) -> bool:
         try:
             self._write_into_buffer(self.iter_segment_content(segment, response))
         except (ChunkedEncodingError, ContentDecodingError, ConnectionError) as err:
@@ -367,10 +461,10 @@ class HLSStreamWriter(SegmentedStreamWriter[HLSSegment, Response]):
         return iterator
 
     # noinspection PyMethodMayBeStatic
-    def get_segment_content(self, segment: HLSSegment, response: Response) -> bytes:
+    def get_segment_content(self, segment: HLSSegment | HLSInitSegment, response: Response) -> bytes:
         return segment.get_content(response)
 
-    def iter_segment_content(self, segment: HLSSegment, response: Response) -> Iterator[bytes]:
+    def iter_segment_content(self, segment: HLSSegment | HLSInitSegment, response: Response) -> Iterator[bytes]:
         yield from segment.iter_content(response, self.WRITE_CHUNK_SIZE)
 
 
