@@ -131,6 +131,17 @@ class DASHStreamWorker(SegmentedStreamWorker[DASHSegment, Response]):
                     continue
 
                 queued = False
+
+                if self.mpd.type == "static":
+                    # Static MPDs are read from the reader's selected period onwards, in MPD order.
+                    # Each period yields its own initialization segment once, right before its first media segment,
+                    # and segment numbers of each period start at the period's own startNumber.
+                    yield from self.iter_segments_static()
+
+                    # close worker (all segments of all remaining periods were put into the writer queue)
+                    self.close()
+                    return
+
                 iter_segments = representation.segments(
                     sequence=self.sequence,
                     init=init,
@@ -156,6 +167,37 @@ class DASHStreamWorker(SegmentedStreamWorker[DASHSegment, Response]):
                     back_off_factor = max(back_off_factor * 1.3, 10.0)
                 else:
                     back_off_factor = 1
+
+    def iter_segments_static(self):
+        periods = self.mpd.periods
+        try:
+            start = periods.index(self.reader.period)
+        except ValueError:
+            start = 0
+
+        first = True
+        for idx in range(start, len(periods)):
+            # find the representation of the current period which matches the reader's selected representation
+            representation = self.mpd.get_representation(self.reader.ident, period=periods[idx])
+            if not representation:
+                log.warning(f"Failed to find matching DASH representation in period {idx}: {self.reader.ident!r}")
+                continue
+
+            init = True
+            iter_segments = representation.segments(
+                sequence=-1,
+                init=True,
+                # sync initial timeline generation between audio and video threads
+                timestamp=self.reader.timestamp if first else None,
+            )
+            first = False
+            for segment in iter_segments:
+                # reset the sequence number on the first media segment of each period,
+                # so no false sequence gap gets detected when the period's numbering restarts
+                if init and not segment.init:
+                    self.sequence = segment.num
+                    init = False
+                yield segment
 
     def reload(self):
         if self.closed:
@@ -209,6 +251,7 @@ class DASHStreamReader(SegmentedStreamReader[DASHSegment, Response]):
     ):
         super().__init__(stream, name=name)
         self.ident = representation.ident
+        self.period = representation.period
         self.mime_type = representation.mimeType
         self.timestamp = timestamp
 

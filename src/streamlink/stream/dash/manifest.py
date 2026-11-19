@@ -422,15 +422,35 @@ class MPD(MPDNode):
         self.periods_map = {period.id: period for period in self.periods if period.id is not None}
         self.programInformation = self.children(ProgramInformation)
 
-    def get_representation(self, ident: TTimelineIdent) -> Representation | None:
+        # Infer missing period durations of static MPDs (ISO 23009-1:2022, 5.3.2.1):
+        # The duration of a period is the difference between its start time and the start time of the next period.
+        # The duration of the last period is the difference between its start time and the MPD's mediaPresentationDuration.
+        if self.type == "static":
+            for idx, period in enumerate(self.periods):
+                if period.duration > timedelta():
+                    continue
+                if idx + 1 < len(self.periods):
+                    duration = self.periods[idx + 1].start - period.start
+                else:
+                    duration = self.mediaPresentationDuration - period.start
+                if duration > timedelta():
+                    period.duration = duration
+
+    def get_representation(self, ident: TTimelineIdent, period: Period | None = None) -> Representation | None:
         """
         Find the first Representation instance with a matching ident
+
+        If a specific period is set, then only search within that period
+        and ignore the period part of the ident, so that representations
+        matching the same adaptation set and representation IDs can be found
+        in other periods than the one the ident was built from.
         """
         p, a, r = ident
-        for period in self.periods:
-            if p != period.id:
+        periods = self.periods if period is None else [period]
+        for period_ in periods:
+            if period is None and p != period_.id:
                 continue
-            for adaptationset in period.adaptationSets:
+            for adaptationset in period_.adaptationSets:
                 if a != adaptationset.id:
                     continue
                 for representation in adaptationset.representations:
@@ -927,7 +947,8 @@ class SegmentTemplate(_MultipleSegmentBaseType):
             available_iter = repeat(self.period.availabilityStartTime)
             duration = self.period.duration.total_seconds() or self.root.mediaPresentationDuration.total_seconds()
             if duration:
-                number_iter = range(self.startNumber, int(duration / self.duration_seconds) + 1)
+                # the segment numbers of each period start at the period's own startNumber
+                number_iter = range(self.startNumber, self.startNumber + int(duration / self.duration_seconds))
             else:
                 number_iter = count(self.startNumber)
         else:

@@ -511,6 +511,56 @@ class TestMPDParser:
             duration = mpd.periods[0].duration.total_seconds()
             assert duration == pytest.approx(204.32)
 
+    def test_segments_static_multi_period(self):
+        """
+        Multiple periods without an id attribute:
+        each period's segment numbers start at its own startNumber
+        and missing period durations are inferred from the next period's start time
+        and from the MPD's mediaPresentationDuration, respectively.
+        """
+        with xml("dash/test_static_multi_period.mpd") as mpd_xml:
+            mpd = MPD(mpd_xml, base_url="http://test/", url="http://test/manifest.mpd")
+
+        assert [period.duration.total_seconds() for period in mpd.periods] == [6.0, 6.0]
+
+        segments = [
+            [(segment.init, segment.num, segment.uri) for segment in adaptationset.representations[0].segments()]
+            for period in mpd.periods
+            for adaptationset in period.adaptationSets
+        ]
+        assert segments == [
+            [
+                (True, -1, "http://test/p0-init.mp4"),
+                (False, 1, "http://test/p0-1.m4s"),
+                (False, 2, "http://test/p0-2.m4s"),
+                (False, 3, "http://test/p0-3.m4s"),
+            ],
+            [
+                (True, -1, "http://test/p1-init.mp4"),
+                (False, 4, "http://test/p1-4.m4s"),
+                (False, 5, "http://test/p1-5.m4s"),
+                (False, 6, "http://test/p1-6.m4s"),
+            ],
+        ]
+
+    def test_get_representation_period(self):
+        with xml("dash/test_static_multi_period.mpd") as mpd_xml:
+            mpd = MPD(mpd_xml, base_url="http://test/", url="http://test/manifest.mpd")
+
+        # both periods have no id attribute, so their representations share the same ident
+        ident = (None, None, "v1")
+        rep_p0 = mpd.periods[0].adaptationSets[0].representations[0]
+        rep_p1 = mpd.periods[1].adaptationSets[0].representations[0]
+        assert rep_p0.ident == rep_p1.ident == ident
+
+        # an unscoped lookup returns the first period's representation
+        assert mpd.get_representation(ident) is rep_p0
+
+        # a scoped lookup ignores the ident's period part and only searches the given period
+        assert mpd.get_representation(ident, period=mpd.periods[0]) is rep_p0
+        assert mpd.get_representation(ident, period=mpd.periods[1]) is rep_p1
+        assert mpd.get_representation((None, None, "unknown"), period=mpd.periods[1]) is None
+
     def test_segments_byterange(self):
         with xml("dash/test_segments_byterange.mpd") as mpd_xml:
             mpd = MPD(mpd_xml, base_url="http://test/", url="http://test/manifest.mpd")

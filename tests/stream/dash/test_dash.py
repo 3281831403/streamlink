@@ -702,6 +702,111 @@ class TestDASHStreamWorker:
         assert mock_wait.call_args_list == [call(5)]
         assert worker._wait.is_set()
 
+    # Verify that static multi-period MPDs are read in MPD order, starting at the reader's selected period
+    @pytest.fixture()
+    def mpd_multi_period(self) -> MPD:
+        with xml("dash/test_static_multi_period.mpd") as mpd_xml:
+            return MPD(mpd_xml, base_url="http://test/manifest.mpd", url="http://test/manifest.mpd")
+
+    @pytest.fixture()
+    def reader_multi_period(self, session: Streamlink, mpd_multi_period: MPD, timestamp: datetime):
+        stream = DASHStream(session, mpd_multi_period)
+        representation = mpd_multi_period.periods[0].adaptationSets[0].representations[0]
+        return Mock(
+            session=session,
+            stream=stream,
+            ident=representation.ident,
+            period=representation.period,
+            timestamp=timestamp,
+        )
+
+    @staticmethod
+    def _run_worker(worker: DASHStreamWorker) -> list[DASHSegment]:
+        # fake worker.run() implementation
+        segments = []
+        segment_iter = TestDASHStreamWorker._iter_segments(worker.iter_segments())
+        while True:
+            try:
+                segment = next(segment_iter)
+            except StopIteration:
+                break
+            worker.check_sequence_gap(segment)
+            worker.sequence = segment.num + 1
+            segments.append(segment)
+        return segments
+
+    def test_static_multi_period(
+        self,
+        caplog: pytest.LogCaptureFixture,
+        reader_multi_period: Mock,
+    ):
+        caplog.set_level("WARNING", "streamlink")
+
+        worker = DASHStreamWorker(reader_multi_period)
+        segments = self._run_worker(worker)
+
+        # both periods are read in MPD order, each yielding its init segment once, before its first media segment,
+        # with segment numbers starting at each period's own startNumber
+        assert [(segment.init, segment.num, segment.uri) for segment in segments] == [
+            (True, -1, "http://test/p0-init.mp4"),
+            (False, 1, "http://test/p0-1.m4s"),
+            (False, 2, "http://test/p0-2.m4s"),
+            (False, 3, "http://test/p0-3.m4s"),
+            (True, -1, "http://test/p1-init.mp4"),
+            (False, 4, "http://test/p1-4.m4s"),
+            (False, 5, "http://test/p1-5.m4s"),
+            (False, 6, "http://test/p1-6.m4s"),
+        ]
+        assert worker._wait.is_set()
+        # no false sequence gaps when the segment numbering restarts at the period boundary
+        assert [record for record in caplog.records if "Sequence gap" in record.message] == []
+
+    def test_static_multi_period_selected_period(
+        self,
+        reader_multi_period: Mock,
+        mpd_multi_period: MPD,
+    ):
+        # a reader whose representation was selected from the second period
+        # only reads that period and the following ones, even if the periods have no id attribute
+        reader_multi_period.period = mpd_multi_period.periods[1]
+
+        worker = DASHStreamWorker(reader_multi_period)
+        segments = self._run_worker(worker)
+
+        assert [(segment.init, segment.num, segment.uri) for segment in segments] == [
+            (True, -1, "http://test/p1-init.mp4"),
+            (False, 4, "http://test/p1-4.m4s"),
+            (False, 5, "http://test/p1-5.m4s"),
+            (False, 6, "http://test/p1-6.m4s"),
+        ]
+        assert worker._wait.is_set()
+
+    def test_static_multi_period_duration_limit(
+        self,
+        caplog: pytest.LogCaptureFixture,
+        session: Streamlink,
+        reader_multi_period: Mock,
+    ):
+        caplog.set_level("INFO", "streamlink")
+        session.set_option("stream-segmented-duration", 8.0)
+
+        worker = DASHStreamWorker(reader_multi_period)
+        worker.run()
+
+        # the duration limit is applied to the accumulated duration of all periods
+        assert [call_arg.args[0] for call_arg in reader_multi_period.writer.put.call_args_list] == [
+            DASHSegment(uri="http://test/p0-init.mp4", num=-1, init=True, duration=0.0),
+            DASHSegment(uri="http://test/p0-1.m4s", num=1, duration=2.0),
+            DASHSegment(uri="http://test/p0-2.m4s", num=2, duration=2.0),
+            DASHSegment(uri="http://test/p0-3.m4s", num=3, duration=2.0),
+            DASHSegment(uri="http://test/p1-init.mp4", num=-1, init=True, duration=0.0),
+            DASHSegment(uri="http://test/p1-4.m4s", num=4, duration=2.0),
+            None,
+        ]
+        assert [(record.name, record.levelname, record.message) for record in caplog.records] == [
+            ("streamlink.stream.segmented", "info", "Stopping stream early after 8.00s"),
+        ]
+
     @pytest.mark.parametrize(
         ("stream", "session"),
         [
